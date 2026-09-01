@@ -4,51 +4,44 @@ import Foundation
   import FoundationNetworking
 #endif
 
-public struct TeslatlasHTTPResponse: Equatable, Sendable {
-  public let statusCode: Int
-  public let headers: [String: String]
-  public let body: Data
+struct HubV1HTTPResponse: Sendable {
+  let statusCode: Int
+  let headers: [String: String]
+  let body: Data
+  let finalURL: URL
 
-  public init(statusCode: Int, headers: [String: String], body: Data) {
-    self.statusCode = statusCode
-    self.headers = headers
-    self.body = body
-  }
-
-  public func header(_ name: String) -> String? {
+  func header(_ name: String) -> String? {
     headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
   }
 }
 
-public protocol TeslatlasHTTPTransport: Sendable {
-  func send(_ request: URLRequest) async throws -> TeslatlasHTTPResponse
+protocol HubV1HTTPTransport: Sendable {
+  func send(_ request: URLRequest) async throws -> HubV1HTTPResponse
 }
 
-public struct URLSessionTeslatlasTransport: TeslatlasHTTPTransport {
-  public static let defaultMaximumResponseBytes = 16 * 1_024 * 1_024
+struct HubV1URLSessionTransport: HubV1HTTPTransport {
+  static let defaultMaximumResponseBytes = 16 * 1_024 * 1_024
 
   private let session: URLSession
   private let maximumResponseBytes: Int
 
-  public init(
-    maximumResponseBytes: Int = Self.defaultMaximumResponseBytes
-  ) {
+  init(maximumResponseBytes: Int = Self.defaultMaximumResponseBytes) {
     self.init(
-      session: URLSession(
-        configuration: Self.isolatedConfiguration(),
-        delegate: TeslatlasRejectRedirectsDelegate(),
-        delegateQueue: nil
-      ),
+      configuration: Self.isolatedConfiguration(),
       maximumResponseBytes: maximumResponseBytes
     )
   }
 
-  public init(
-    session: URLSession,
+  init(
+    configuration: URLSessionConfiguration,
     maximumResponseBytes: Int = Self.defaultMaximumResponseBytes
   ) {
     precondition(maximumResponseBytes > 0)
-    self.session = session
+    session = URLSession(
+      configuration: configuration,
+      delegate: HubV1RejectRedirectsDelegate(),
+      delegateQueue: nil
+    )
     self.maximumResponseBytes = maximumResponseBytes
   }
 
@@ -60,84 +53,83 @@ public struct URLSessionTeslatlasTransport: TeslatlasHTTPTransport {
     configuration.urlCredentialStorage = nil
     configuration.urlCache = nil
     configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    configuration.timeoutIntervalForRequest = 20
+    configuration.timeoutIntervalForResource = 30
     return configuration
   }
 
-  public func send(_ request: URLRequest) async throws -> TeslatlasHTTPResponse {
-    #if canImport(FoundationNetworking)
-      let (data, httpResponse) = try await TeslatlasBoundedDataLoader(
-        configuration: session.configuration,
-        maximumResponseBytes: maximumResponseBytes
-      ).load(request)
-    #else
-      let (bytes, response) = try await session.bytes(for: request)
-      guard let httpResponse = response as? HTTPURLResponse else {
-        throw TeslatlasSDKError.invalidResponse(
-          statusCode: 0,
-          requestID: nil,
-          reason: "transport returned a non-HTTP response"
-        )
-      }
-      let requestID = httpResponse.value(forHTTPHeaderField: "X-Request-ID")
-      if httpResponse.expectedContentLength > maximumResponseBytes {
-        throw responseTooLarge(
-          statusCode: httpResponse.statusCode,
-          requestID: requestID
-        )
-      }
-
-      var data = Data()
-      if httpResponse.expectedContentLength > 0 {
-        data.reserveCapacity(Int(httpResponse.expectedContentLength))
-      }
-      for try await byte in bytes {
-        guard data.count < maximumResponseBytes else {
-          throw responseTooLarge(
-            statusCode: httpResponse.statusCode,
-            requestID: requestID
+  func send(_ request: URLRequest) async throws -> HubV1HTTPResponse {
+    let data: Data
+    let http: HTTPURLResponse
+    do {
+      #if canImport(FoundationNetworking)
+        (data, http) = try await HubV1BoundedDataLoader(
+          configuration: session.configuration,
+          maximumResponseBytes: maximumResponseBytes
+        ).load(request)
+      #else
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let response = response as? HTTPURLResponse else {
+          throw HubV1Error.invalidResponse(
+            statusCode: 0,
+            requestID: nil,
+            reason: "transport returned a non-HTTP response"
           )
         }
-        data.append(byte)
-      }
-    #endif
+        if response.expectedContentLength > maximumResponseBytes {
+          throw responseTooLarge(response)
+        }
+        var received = Data()
+        if response.expectedContentLength > 0 {
+          received.reserveCapacity(Int(response.expectedContentLength))
+        }
+        for try await byte in bytes {
+          guard received.count < maximumResponseBytes else {
+            throw responseTooLarge(response)
+          }
+          received.append(byte)
+        }
+        data = received
+        http = response
+      #endif
+    } catch let error as HubV1Error {
+      throw error
+    } catch let error as URLError {
+      throw HubV1Error.transportFailure(code: error.errorCode)
+    } catch {
+      throw HubV1Error.transportFailure(code: -1)
+    }
+
+    guard let finalURL = http.url else {
+      throw HubV1Error.invalidResponse(
+        statusCode: http.statusCode,
+        requestID: http.value(forHTTPHeaderField: "X-Request-ID"),
+        reason: "HTTP response URL is unavailable"
+      )
+    }
 
     var headers: [String: String] = [:]
-    for (key, value) in httpResponse.allHeaderFields {
+    for (key, value) in http.allHeaderFields {
       headers[String(describing: key)] = String(describing: value)
     }
-    return TeslatlasHTTPResponse(
-      statusCode: httpResponse.statusCode,
+    return HubV1HTTPResponse(
+      statusCode: http.statusCode,
       headers: headers,
-      body: data
+      body: data,
+      finalURL: finalURL
     )
   }
 
-  private func responseTooLarge(statusCode: Int, requestID: String?)
-    -> TeslatlasSDKError
-  {
+  private func responseTooLarge(_ response: HTTPURLResponse) -> HubV1Error {
     .invalidResponse(
-      statusCode: statusCode,
-      requestID: requestID,
+      statusCode: response.statusCode,
+      requestID: response.value(forHTTPHeaderField: "X-Request-ID"),
       reason: "response body exceeds \(maximumResponseBytes) bytes"
     )
   }
 }
 
-class TeslatlasRejectRedirectsDelegate: NSObject, URLSessionTaskDelegate,
-  @unchecked Sendable
-{
-  func urlSession(
-    _ session: URLSession,
-    task: URLSessionTask,
-    willPerformHTTPRedirection response: HTTPURLResponse,
-    newRequest request: URLRequest,
-    completionHandler: @escaping @Sendable (URLRequest?) -> Void
-  ) {
-    completionHandler(nil)
-  }
-}
-
-struct TeslatlasBoundedBodyAccumulator {
+struct HubV1BoundedBodyAccumulator {
   let maximumBytes: Int
   private(set) var data = Data()
 
@@ -156,13 +148,13 @@ struct TeslatlasBoundedBodyAccumulator {
 }
 
 #if canImport(FoundationNetworking)
-  private final class TeslatlasBoundedDataLoader:
-    TeslatlasRejectRedirectsDelegate, URLSessionDataDelegate, @unchecked Sendable
+  private final class HubV1BoundedDataLoader: NSObject, URLSessionDataDelegate,
+    @unchecked Sendable
   {
     private let configuration: URLSessionConfiguration
     private let maximumResponseBytes: Int
     private let lock = NSLock()
-    private var accumulator: TeslatlasBoundedBodyAccumulator
+    private var accumulator: HubV1BoundedBodyAccumulator
     private var response: HTTPURLResponse?
     private var continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
     private var session: URLSession?
@@ -173,7 +165,7 @@ struct TeslatlasBoundedBodyAccumulator {
     init(configuration: URLSessionConfiguration, maximumResponseBytes: Int) {
       self.configuration = configuration
       self.maximumResponseBytes = maximumResponseBytes
-      accumulator = TeslatlasBoundedBodyAccumulator(
+      accumulator = HubV1BoundedBodyAccumulator(
         maximumBytes: maximumResponseBytes
       )
     }
@@ -239,7 +231,7 @@ struct TeslatlasBoundedBodyAccumulator {
       let disposition = lock.withLock { () -> URLSession.ResponseDisposition in
         guard terminalError == nil else { return .cancel }
         guard let response = response as? HTTPURLResponse else {
-          terminalError = TeslatlasSDKError.invalidResponse(
+          terminalError = HubV1Error.invalidResponse(
             statusCode: 0,
             requestID: nil,
             reason: "transport returned a non-HTTP response"
@@ -266,7 +258,7 @@ struct TeslatlasBoundedBodyAccumulator {
         guard accumulator.append(data) else {
           terminalError =
             response.map(responseTooLarge)
-            ?? TeslatlasSDKError.invalidResponse(
+            ?? HubV1Error.invalidResponse(
               statusCode: 0,
               requestID: nil,
               reason: "response body exceeds \(maximumResponseBytes) bytes"
@@ -304,7 +296,7 @@ struct TeslatlasBoundedBodyAccumulator {
           result = .success((accumulator.data, response))
         } else {
           result = .failure(
-            TeslatlasSDKError.invalidResponse(
+            HubV1Error.invalidResponse(
               statusCode: 0,
               requestID: nil,
               reason: "transport returned a non-HTTP response"
@@ -324,9 +316,17 @@ struct TeslatlasBoundedBodyAccumulator {
       }
     }
 
-    private func responseTooLarge(_ response: HTTPURLResponse)
-      -> TeslatlasSDKError
-    {
+    func urlSession(
+      _ session: URLSession,
+      task: URLSessionTask,
+      willPerformHTTPRedirection response: HTTPURLResponse,
+      newRequest request: URLRequest,
+      completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+      completionHandler(nil)
+    }
+
+    private func responseTooLarge(_ response: HTTPURLResponse) -> HubV1Error {
       .invalidResponse(
         statusCode: response.statusCode,
         requestID: response.value(forHTTPHeaderField: "X-Request-ID"),
@@ -336,34 +336,16 @@ struct TeslatlasBoundedBodyAccumulator {
   }
 #endif
 
-public protocol TeslatlasAuthorization: Sendable {
-  func apply(to request: inout URLRequest)
-}
-
-public struct BearerCredential: TeslatlasAuthorization, Sendable,
-  CustomStringConvertible, CustomDebugStringConvertible
+final class HubV1RejectRedirectsDelegate: NSObject, URLSessionTaskDelegate,
+  @unchecked Sendable
 {
-  private let token: String
-
-  public init(_ token: String) throws {
-    guard !token.isEmpty,
-      token.unicodeScalars.allSatisfy({
-        !CharacterSet.controlCharacters.contains($0)
-      })
-    else {
-      throw TeslatlasSDKError.invalidResponse(
-        statusCode: 0,
-        requestID: nil,
-        reason: "bearer credential is empty or contains control characters"
-      )
-    }
-    self.token = token
-  }
-
-  public var description: String { "BearerCredential(<redacted>)" }
-  public var debugDescription: String { description }
-
-  public func apply(to request: inout URLRequest) {
-    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping @Sendable (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
   }
 }
